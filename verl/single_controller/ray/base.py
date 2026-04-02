@@ -14,6 +14,7 @@
 import inspect
 import logging
 import os
+import re
 import socket
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -85,8 +86,14 @@ def detect_error_type(error_message: str) -> tuple[bool, str, str]:
     """
     error_lower = error_message.lower()
     
+    # Helper function to check both exact strings and regex patterns
+    def check_keywords(keywords, is_regex=False):
+        if is_regex:
+            return any(re.search(pattern, error_lower) for pattern in keywords)
+        return any(keyword in error_lower for keyword in keywords)
+    
     # --- OOM Error Detection --- #
-    # Device-side OOM (GPU/NPU)
+    # Device-side OOM (GPU/NPU) - all exact string matches
     oom_device_keywords = [
         "cuda out of memory",
         "npu out of memory",
@@ -95,13 +102,12 @@ def detect_error_type(error_message: str) -> tuple[bool, str, str]:
         "gpu out of memory",
         "accelerator out of memory"
     ]
-    # Host-side RAM OOM
-    oom_host_keywords = [
+    # Host-side RAM OOM - separate exact strings and regex patterns
+    oom_host_exact = [
         "memoryerror",
         "cannot allocate memory",
         "failed to allocate memory",
         "unable to allocate",
-        "allocation of .* bytes failed",
         "not enough memory",
         "insufficient memory",
         "ran out of memory",
@@ -109,7 +115,10 @@ def detect_error_type(error_message: str) -> tuple[bool, str, str]:
         "allocate_bytes",
         "oom: system memory"
     ]
-    # General OOM keywords
+    oom_host_regex = [
+        "allocation of .* bytes failed"
+    ]
+    # General OOM keywords - all exact string matches
     oom_general_keywords = [
         "out of memory",
         "oom",
@@ -117,11 +126,11 @@ def detect_error_type(error_message: str) -> tuple[bool, str, str]:
     ]
     
     # Check OOM errors in order of specificity
-    if any(keyword in error_lower for keyword in oom_device_keywords):
+    if check_keywords(oom_device_keywords):
         return True, "oom", "device"
-    elif any(keyword in error_lower for keyword in oom_host_keywords):
+    elif check_keywords(oom_host_exact) or check_keywords(oom_host_regex, is_regex=True):
         return True, "oom", "host"
-    elif any(keyword in error_lower for keyword in oom_general_keywords):
+    elif check_keywords(oom_general_keywords):
         return True, "oom", "unknown"
     
     # --- Connection Error Detection --- #
