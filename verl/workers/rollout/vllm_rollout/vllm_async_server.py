@@ -108,6 +108,7 @@ class vLLMHttpServer:
             cuda_visible_devices (str): cuda visible devices.
         """
         os.environ[get_visible_devices_keyword()] = cuda_visible_devices
+        os.environ["VERL_REPLICA_RANK"] = str(replica_rank)
 
         self.config = self._init_config(config)
         self.model_config = self._init_model_config(model_config)
@@ -855,14 +856,14 @@ class vLLMHttpServer:
         """HYBRID sleep: lora adapters only need level=1; full weights need level=2."""
         # Don't use engine.sleep(level=2) here
         # lora only update adapter weights, so set sleep level to 1
-        if self.lora_as_adapter:
+        # vllm_ascend not support sleep_level now. Enabling EP during training may lead to accuracy issues.
+        if self.lora_as_adapter or is_torch_npu_available(check_device=False):
             sleep_level = 1
         else:
             sleep_level = 2
         await self.engine.collective_rpc("sleep", kwargs={"level": sleep_level})
-
-        # clear encoder cache: https://github.com/vllm-project/vllm/pull/33452
-        # await self.engine.reset_encoder_cache()
+        if _VLLM_VERSION >= version.parse("0.17.0"):
+            await self.engine.reset_encoder_cache()
 
 
 class vLLMReplica(RolloutReplica):
@@ -874,8 +875,11 @@ class vLLMReplica(RolloutReplica):
         gpus_per_node: int = 8,
         is_reward_model: bool = False,
         is_teacher_model: bool = False,
+        name_suffix: str = "",
     ):
-        super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model, is_teacher_model)
+        super().__init__(
+            replica_rank, config, model_config, gpus_per_node, is_reward_model, is_teacher_model, name_suffix
+        )
         self.server_class = ray.remote(vLLMHttpServer)
 
     async def launch_servers(self):
@@ -911,11 +915,11 @@ class vLLMReplica(RolloutReplica):
             node_id = worker_node_ids[node_rank * gpus_per_replica_node]
             prefix = self._get_server_name_prefix()
             if self.is_reward_model:
-                name = f"{prefix}server_reward_{self.replica_rank}_{node_rank}"
+                name = f"{prefix}server_reward_{self.replica_rank}_{node_rank}{self.name_suffix}"
             elif self.is_teacher_model:
-                name = f"{prefix}server_teacher_{self.replica_rank}_{node_rank}"
+                name = f"{prefix}server_teacher_{self.replica_rank}_{node_rank}{self.name_suffix}"
             else:
-                name = f"{prefix}server_{self.replica_rank}_{node_rank}"
+                name = f"{prefix}server_{self.replica_rank}_{node_rank}{self.name_suffix}"
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                     node_id=node_id,

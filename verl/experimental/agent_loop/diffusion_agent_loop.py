@@ -35,7 +35,7 @@ from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.protocol import DataProto
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import get_dataset_class
-from verl.workers.config import DiffusionModelConfig, RolloutConfig
+from verl.workers.config import DiffusionModelConfig, DiffusionRolloutConfig
 
 
 class DiffusionAgentLoopOutput(BaseModel):
@@ -46,11 +46,9 @@ class DiffusionAgentLoopOutput(BaseModel):
     prompt_ids: list[int]
     """Prompt token ids."""
     response_diffusion_output: Any
-    """Response diffusion output: image tensor (CHW) / video tensor (TCHW)."""
+    """Response diffusion output (torch.Tensor): image tensor (CHW) / video tensor (TCHW)."""
     response_logprobs: Optional[Any] = None
-    """Log probabilities for the response tokens."""
-    multi_modal_data: Optional[dict[str, Any]] = None
-    """Multi-modal data for multi-modal tools."""
+    """Log probabilities for the response tokens. (torch.Tensor)"""
     reward_score: Optional[float] = None
     """Reward score for the trajectory."""
     num_turns: int = 0
@@ -75,9 +73,7 @@ class _InternalDiffusionAgentLoopOutput(DiffusionAgentLoopOutput):
     attention_mask: torch.Tensor
     """Padded attention mask."""
     response_logprobs: Optional[torch.Tensor] = None
-    """Log probabilities for the response tokens."""
-    multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
-    """Multi-modal inputs for processors (e.g. pixel_values, image_grid_thw, video_grid_thw)."""
+    """Log probabilities over denoising timesteps."""
     extra_fields: dict[str, Any] = {}
     """Extra fields for dynamic addition."""
 
@@ -87,7 +83,10 @@ class DiffusionAgentLoopWorker:
 
     Args:
         config (DictConfig): whole config for main entrypoint.
-        server_handles (List[ray.actor.ActorHandle]): OpenAI compatible LLM server actor handles.
+        servers (list[tuple[str, ray.actor.ActorHandle]]): (address, handle) pairs for each LLM server.
+        load_balancer_handle (ray.actor.ActorHandle): shared global load balancer actor.
+        teacher_servers (list[tuple[str, ray.actor.ActorHandle]]): Not used.
+        teacher_load_balancer_handle (ray.actor.ActorHandle): Not used.
         reward_loop_worker_handles (List[ray.actor.ActorHandle]): Actor handles for streaming reward computation.
     """
 
@@ -96,20 +95,13 @@ class DiffusionAgentLoopWorker:
         config: DictConfig,
         servers: list[tuple[str, ray.actor.ActorHandle]],
         load_balancer_handle: ray.actor.ActorHandle,
-        reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
         teacher_servers: list[tuple[str, ray.actor.ActorHandle]] = None,
         teacher_load_balancer_handle: ray.actor.ActorHandle = None,
+        reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
     ):
-        """Initialize agent loop manager.
-        Args:
-            config (DictConfig): YAML config.
-            servers (list[tuple[str, ray.actor.ActorHandle]]): (address, handle) pairs for each LLM server.
-            load_balancer_handle (ray.actor.ActorHandle): shared global load balancer actor.
-            reward_loop_worker_handles (list[ray.actor.ActorHandle]): Actor handles for streaming reward computation.
-        """
         self.config = config
         rollout_config, model_config = _get_rollout_and_model_config(config)
-        self.rollout_config: RolloutConfig = omega_conf_to_dataclass(rollout_config)
+        self.rollout_config: DiffusionRolloutConfig = omega_conf_to_dataclass(rollout_config)
         self.model_config: DiffusionModelConfig = omega_conf_to_dataclass(model_config)
 
         if not hasattr(self, "server_manager"):
@@ -125,7 +117,7 @@ class DiffusionAgentLoopWorker:
         self.tokenizer = self.model_config.tokenizer
         self.processor = self.model_config.processor
 
-        self.max_prompt_embed_length = self.model_config.extra_configs.get(
+        self.max_prompt_embed_length = self.rollout_config.extra_configs.get(
             "max_sequence_length", self.rollout_config.prompt_length
         )
 
@@ -158,7 +150,7 @@ class DiffusionAgentLoopWorker:
         """
         config = self.rollout_config
 
-        sampling_params = dict(self.model_config.extra_configs)
+        sampling_params = dict(config.extra_configs)
         sampling_params.update(
             height=config.height,
             width=config.width,
@@ -166,10 +158,11 @@ class DiffusionAgentLoopWorker:
             logprobs=config.calculate_log_probs,
         )
 
+        # override sampling params for validation
         if batch.meta_info.get("validate", False):
+            sampling_params.update(config.val_kwargs.extra_configs)
             sampling_params["num_inference_steps"] = config.val_kwargs.num_inference_steps
             sampling_params["seed"] = config.val_kwargs.seed
-            sampling_params["noise_level"] = config.val_kwargs.noise_level
 
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch.non_tensor_batch:
@@ -212,12 +205,10 @@ class DiffusionAgentLoopWorker:
 
     async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalDiffusionAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
-        # handling extra tensor ouputs from vllm-omni, like prompt embedding, etc.
+        # Pad extra tensor outputs from vllm-omni (e.g. prompt embeddings).
         extra_fields = {}
         for k, v in output.extra_fields.items():
             if isinstance(v, torch.Tensor):
-                # handle prompt embedding padding
-                # TODO (andy): reduce padding length for more effiency
                 if k in ["prompt_embeds", "negative_prompt_embeds"]:
                     pad_tuple = (0, 0, 0, self.max_prompt_embed_length - v.shape[0])
                     v = F.pad(v, pad_tuple, value=0)
@@ -230,7 +221,6 @@ class DiffusionAgentLoopWorker:
 
         extra_fields["raw_prompt"] = kwargs["raw_prompt"]
 
-        self.tokenizer.padding_side = "left"
         prompt_output = self.tokenizer.pad(
             {"input_ids": output.prompt_ids},
             padding="max_length",
@@ -242,17 +232,11 @@ class DiffusionAgentLoopWorker:
             prompt_output["input_ids"] = prompt_output["input_ids"].unsqueeze(0)
             prompt_output["attention_mask"] = prompt_output["attention_mask"].unsqueeze(0)
 
-        if isinstance(output.response_diffusion_output, torch.Tensor):
-            response_diffusion_output = output.response_diffusion_output.unsqueeze(0)
-        else:
-            response_diffusion_output = torch.tensor(output.response_diffusion_output).unsqueeze(0)
+        response_diffusion_output = output.response_diffusion_output.unsqueeze(0)
 
         response_logprobs = None
         if output.response_logprobs is not None:
-            if isinstance(output.response_logprobs, torch.Tensor):
-                response_logprobs = output.response_logprobs.unsqueeze(0)
-            else:
-                response_logprobs = torch.tensor(output.response_logprobs).unsqueeze(0)
+            response_logprobs = output.response_logprobs.unsqueeze(0)
 
         attention_mask = prompt_output["attention_mask"]
         input_ids = prompt_output["input_ids"]
@@ -275,7 +259,6 @@ class DiffusionAgentLoopWorker:
             input_ids=input_ids,
             attention_mask=attention_mask,
             response_logprobs=response_logprobs,
-            multi_modal_data=output.multi_modal_data,
             reward_score=output.reward_score,
             num_turns=output.num_turns,
             metrics=output.metrics,
@@ -336,8 +319,7 @@ class DiffusionAgentLoopWorker:
         batch = TensorDict(
             {
                 "prompts": prompt_ids,  # [bsz, prompt_length]
-                # responses: [bsz, C, H, W] image or [bsz, T, C, H, W] video
-                "responses": response_diffusion_output,
+                "responses": response_diffusion_output,  # [bsz, C, H, W] or [bsz, T, C, H, W]
                 "input_ids": input_ids,  # [bsz, prompt_length]
                 "attention_mask": attention_mask,  # [bsz, prompt_length]
                 **optional_outputs,
@@ -361,11 +343,6 @@ class DiffusionAgentLoopWorker:
         reward_extra_keys = list(reward_extra_infos[0].keys())
         for key in reward_extra_keys:
             non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
-
-        # Add multi_modal_inputs to non_tensor_batch if any samples have them
-        multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]
-        if any(mmi is not None for mmi in multi_modal_inputs_list):
-            non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs_list, dtype=object)
 
         metrics = [input.metrics.model_dump() for input in inputs]
         # Collect extra fields from all inputs and convert them to np.ndarray

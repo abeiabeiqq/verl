@@ -170,6 +170,37 @@ def get_model(
     return model
 
 
+def get_hf_rope_theta(hf_config: PretrainedConfig) -> float:
+    """Return RoPE base frequency theta.
+
+    Most configs expose ``rope_theta`` on the root. Newer models (e.g. Qwen3 in transformers>=5) store it under
+    ``rope_parameters["rope_theta"]``, optionally nested per attention pattern when ``rope_parameters`` maps names
+    to parameter dicts.
+    """
+    # For transformers <= 4.57.6
+    if hasattr(hf_config, "rope_theta"):
+        return hf_config.rope_theta
+    if hasattr(hf_config, "text_config") and hasattr(hf_config.text_config, "rope_theta"):
+        return hf_config.text_config.rope_theta
+
+    # For transformers >= 5.0.0, check rope_parameters dict (optionally nested) for rope_theta
+    rp = None
+    if hasattr(hf_config, "rope_parameters"):
+        rp = hf_config.rope_parameters
+    elif hasattr(hf_config, "text_config") and hasattr(hf_config.text_config, "rope_parameters"):
+        rp = hf_config.text_config.rope_parameters
+    if isinstance(rp, dict):
+        if "rope_theta" in rp:
+            return rp["rope_theta"]
+        for v in rp.values():
+            if isinstance(v, dict) and "rope_theta" in v:
+                return v["rope_theta"]
+    raise AttributeError(
+        f"{type(hf_config).__name__} has no rope_theta and no rope_parameters['rope_theta'] — "
+        "cannot determine RoPE base."
+    )
+
+
 @dataclass
 class McoreModuleWrapperConfig:
     """Configuration for Mcore module wrapper."""
@@ -1443,6 +1474,33 @@ def dynamic_cp_merge_output(
     return merged_output
 
 
+def _get_mtp_num_layers(hf_config):
+    """Get MTP layer count from various config formats.
+
+    Supports:
+        - num_nextn_predict_layers (DeepSeek, Qwen3 style)
+        - mtp_num_hidden_layers (Qwen3.5 style, in hf_config or text_config)
+    """
+    if hasattr(hf_config, "num_nextn_predict_layers") and hf_config.num_nextn_predict_layers > 0:
+        return hf_config.num_nextn_predict_layers
+    if hasattr(hf_config, "mtp_num_hidden_layers") and hf_config.mtp_num_hidden_layers > 0:
+        return hf_config.mtp_num_hidden_layers
+    if hasattr(hf_config, "text_config") and hasattr(hf_config.text_config, "mtp_num_hidden_layers"):
+        if hf_config.text_config.mtp_num_hidden_layers > 0:
+            return hf_config.text_config.mtp_num_hidden_layers
+    return 0
+
+
+def _set_mtp_num_layers(hf_config, value: int):
+    """Set MTP layer count in the appropriate config field."""
+    if hasattr(hf_config, "num_nextn_predict_layers"):
+        hf_config.num_nextn_predict_layers = value
+    elif hasattr(hf_config, "mtp_num_hidden_layers"):
+        hf_config.mtp_num_hidden_layers = value
+    elif hasattr(hf_config, "text_config") and hasattr(hf_config.text_config, "mtp_num_hidden_layers"):
+        hf_config.text_config.mtp_num_hidden_layers = value
+
+
 def check_mtp_config(model_config: HFModelConfig, engine_config: McoreEngineConfig):
     """
     Check and configure MTP (Multi-Token Prediction) settings.
@@ -1453,17 +1511,15 @@ def check_mtp_config(model_config: HFModelConfig, engine_config: McoreEngineConf
         - mtp.enable == True and has MTP layers: configure override_transformer_config
         - mtp.enable == True and no MTP layers: raise ValueError
     """
-    has_mtp = (
-        model_config.hf_config.num_nextn_predict_layers > 0
-        if hasattr(model_config.hf_config, "num_nextn_predict_layers")
-        else False
-    )
+    hf_config = model_config.hf_config
+    mtp_num_layers = _get_mtp_num_layers(hf_config)
+    has_mtp = mtp_num_layers > 0
     enable_mtp = model_config.mtp.enable
 
     if not enable_mtp and not has_mtp:
         return
     elif not enable_mtp and has_mtp:
-        model_config.hf_config.num_nextn_predict_layers = 0
+        _set_mtp_num_layers(hf_config, 0)
     elif enable_mtp and not has_mtp:
         raise ValueError("enable mtp while model has no mtp layer, please use a model with mtp layer")
     elif enable_mtp and has_mtp:
@@ -1523,6 +1579,8 @@ def copy_megatron_model_to_cpu(models):
                     # Copy parameter data to CPU
                     if buffer.param_data.storage().size() > 0:
                         buffer_state["param_data"] = buffer.param_data.data.cpu().clone().pin_memory()
+                    else:
+                        buffer_state["param_data"] = buffer.param_data.cpu_data.clone().pin_memory()
 
                     buffer_list.append(buffer_state)
                 buffer_states.append(buffer_list)
@@ -1565,7 +1623,10 @@ def restore_megatron_model_from_cpu(models, cpu_state):
                 for buffer, buffer_state in zip(buffers, buffer_list, strict=False):
                     # Restore parameter data
                     if "param_data" in buffer_state:
-                        buffer.param_data.data.copy_(buffer_state["param_data"].to(buffer.param_data.device))
+                        if buffer.param_data.storage().size() > 0:
+                            buffer.param_data.data.copy_(buffer_state["param_data"].to(buffer.param_data.device))
+                        else:
+                            buffer.param_data.cpu_data.copy_(buffer_state["param_data"])
 
         elif not chunk_state["is_ddp"] and not isinstance(model_chunk, DDP):
             # Restore non-DDP models
